@@ -144,11 +144,17 @@ void Rotate2_Ctor(Rotate2* unit);
 #ifdef NOVA_SIMD
 FLATTEN void LinPan2_next_ak_nova(LinPan2* unit, int inNumSamples);
 FLATTEN void LinPan2_next_ak_nova_64(LinPan2* unit, int inNumSamples);
+FLATTEN void LinPan2_next_aa_nova(LinPan2* unit, int inNumSamples);
 #endif
 
 void LinPan2_Ctor(LinPan2* unit) {
     if (INRATE(1) == calc_FullRate) {
-        SETCALC(LinPan2_next_aa);
+#ifdef NOVA_SIMD
+        if (boost::alignment::is_aligned(BUFLENGTH, 16))
+            SETCALC(LinPan2_next_aa_nova);
+        else
+#endif
+            SETCALC(LinPan2_next_aa);
     } else {
 #ifdef NOVA_SIMD
         if (BUFLENGTH == 64)
@@ -261,6 +267,43 @@ void LinPan2_next_aa(LinPan2* unit, int inNumSamples) {
           ZXP(rightout) = zin * rightamp; level += levelSlope;);
     unit->m_level = level;
 }
+
+#ifdef NOVA_SIMD
+// The linear pan law is pure elementwise arithmetic, so an audio-rate pan position
+// vectorizes just as well as the control-rate case. The only state carried across
+// samples is the level ramp, which set_slope() spreads over the lanes.
+FLATTEN void LinPan2_next_aa_nova(LinPan2* unit, int inNumSamples) {
+    const int vecSize = nova::vec<float>::size;
+
+    float* leftout = OUT(0);
+    float* rightout = OUT(1);
+    const float* in = IN(0);
+    const float* pos = IN(1);
+
+    float nextlevel = ZIN0(2);
+    float level = unit->m_level;
+    float levelSlope = (nextlevel - level) * unit->mRate->mSlopeFactor;
+
+    nova::vec<float> vlevel;
+    const nova::vec<float> levelIncrement(vlevel.set_slope(level, levelSlope));
+
+    for (int i = 0; i != inNumSamples; i += vecSize) {
+        nova::vec<float> vpos, vin;
+        vpos.load_aligned(pos + i);
+        vin.load_aligned(in + i);
+
+        nova::vec<float> rightamp = vlevel * (vpos * 0.5f + 0.5f);
+        nova::vec<float> leftamp = vlevel - rightamp;
+
+        (vin * leftamp).store_aligned(leftout + i);
+        (vin * rightamp).store_aligned(rightout + i);
+
+        vlevel += levelIncrement;
+    }
+
+    unit->m_level = level + inNumSamples * levelSlope;
+}
+#endif
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -605,6 +648,34 @@ void LinXFade2_next_a(LinXFade2* unit, int inNumSamples) {
 }
 
 #ifdef NOVA_SIMD
+// Linear crossfade with an audio-rate position is entirely stateless, so the block
+// vectorizes without any carried dependency at all.
+FLATTEN void LinXFade2_next_a_nova(LinXFade2* unit, int inNumSamples) {
+    const int vecSize = nova::vec<float>::size;
+
+    float* out = OUT(0);
+    const float* leftin = IN(0);
+    const float* rightin = IN(1);
+    const float* posp = IN(2);
+
+    const nova::vec<float> lo(-1.f), hi(1.f);
+
+    for (int i = 0; i != inNumSamples; i += vecSize) {
+        nova::vec<float> pos, l, r;
+        pos.load_aligned(posp + i);
+        l.load_aligned(leftin + i);
+        r.load_aligned(rightin + i);
+
+        // sc_clip(pos, -1.f, 1.f)
+        pos = max_(min_(pos, hi), lo);
+        nova::vec<float> amp = pos * 0.5f + 0.5f;
+
+        (l + amp * (r - l)).store_aligned(out + i);
+    }
+}
+#endif
+
+#ifdef NOVA_SIMD
 
 FLATTEN void LinXFade2_next_i_nova(LinXFade2* unit, int inNumSamples) {
     float amp = unit->m_amp;
@@ -641,7 +712,12 @@ FLATTEN void LinXFade2_next_k_nova(LinXFade2* unit, int inNumSamples) {
 void LinXFade2_Ctor(LinXFade2* unit) {
     switch (INRATE(2)) {
     case calc_FullRate:
-        SETCALC(LinXFade2_next_a);
+#ifdef NOVA_SIMD
+        if (boost::alignment::is_aligned(BUFLENGTH, 16))
+            SETCALC(LinXFade2_next_a_nova);
+        else
+#endif
+            SETCALC(LinXFade2_next_a);
         break;
 
     case calc_BufRate:
@@ -1461,8 +1537,73 @@ void Rotate2_next_ak(Rotate2* unit, int inNumSamples) {
     }
 }
 
+#ifdef NOVA_SIMD
+// The rotation matrix is applied elementwise; only the sin/cos ramps carry state,
+// and those are plain linear ramps. Ramped is a template parameter so the steady
+// state case does not pay for adding a zero increment every iteration.
+template <bool Ramped>
+static inline void Rotate2_next_ak_nova_loop(float* xout, float* yout, const float* xin, const float* yin,
+                                             int inNumSamples, nova::vec<float> vsint, nova::vec<float> vcost,
+                                             nova::vec<float> sinIncrement, nova::vec<float> cosIncrement) {
+    const int vecSize = nova::vec<float>::size;
+
+    for (int i = 0; i != inNumSamples; i += vecSize) {
+        nova::vec<float> x, y;
+        x.load_aligned(xin + i);
+        y.load_aligned(yin + i);
+
+        (vcost * x + vsint * y).store_aligned(xout + i);
+        (vcost * y - vsint * x).store_aligned(yout + i);
+
+        if (Ramped) {
+            vsint += sinIncrement;
+            vcost += cosIncrement;
+        }
+    }
+}
+
+FLATTEN void Rotate2_next_ak_nova(Rotate2* unit, int inNumSamples) {
+    float* xout = OUT(0);
+    float* yout = OUT(1);
+    const float* xin = IN(0);
+    const float* yin = IN(1);
+    float pos = ZIN0(2);
+    float sint = unit->m_sint;
+    float cost = unit->m_cost;
+
+    if (pos != unit->m_pos) {
+        int kSineSize = ft->mSineSize;
+        int kSineMask = kSineSize - 1;
+
+        int32 isinpos = kSineMask & (int32)(pos * (float)(kSineSize >> 1));
+        int32 icospos = kSineMask & ((kSineSize >> 2) + isinpos);
+
+        float nextsint = unit->m_sint = ft->mSine[isinpos];
+        float nextcost = unit->m_cost = ft->mSine[icospos];
+
+        float slopeFactor = unit->mRate->mSlopeFactor;
+
+        nova::vec<float> vsint, vcost;
+        nova::vec<float> sinIncrement(vsint.set_slope(sint, (nextsint - sint) * slopeFactor));
+        nova::vec<float> cosIncrement(vcost.set_slope(cost, (nextcost - cost) * slopeFactor));
+
+        Rotate2_next_ak_nova_loop<true>(xout, yout, xin, yin, inNumSamples, vsint, vcost, sinIncrement, cosIncrement);
+        unit->m_pos = pos;
+    } else {
+        nova::vec<float> zero(0.f);
+        Rotate2_next_ak_nova_loop<false>(xout, yout, xin, yin, inNumSamples, nova::vec<float>(sint),
+                                         nova::vec<float>(cost), zero, zero);
+    }
+}
+#endif
+
 void Rotate2_Ctor(Rotate2* unit) {
-    SETCALC(Rotate2_next_ak);
+#ifdef NOVA_SIMD
+    if (boost::alignment::is_aligned(BUFLENGTH, 16))
+        SETCALC(Rotate2_next_ak_nova);
+    else
+#endif
+        SETCALC(Rotate2_next_ak);
 
     unit->m_pos = ZIN0(2);
     int32 isinpos = 8191 & (int32)(4096.f * unit->m_pos);

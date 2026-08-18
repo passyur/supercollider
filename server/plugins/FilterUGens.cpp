@@ -20,7 +20,15 @@
 
 
 #include "SC_PlugIn.h"
+#include "function_attributes.h"
 
+#ifdef NOVA_SIMD
+#    include "vec.hpp"
+#endif
+
+#include <boost/align/is_aligned.hpp>
+
+#include <cstring>
 #include <limits>
 
 // NaNs are not equal to any floating point number
@@ -358,6 +366,15 @@ void Flip_next_odd(Flip* unit, int inNumSamples);
 
 void Delay2_next(Delay2* unit, int inNumSamples);
 void Delay2_Ctor(Delay2* unit);
+
+#ifdef NOVA_SIMD
+FLATTEN void LPZ1_next_nova(LPZ1* unit, int inNumSamples);
+FLATTEN void HPZ1_next_nova(HPZ1* unit, int inNumSamples);
+FLATTEN void Delay1_next_nova(Delay1* unit, int inNumSamples);
+FLATTEN void Delay2_next_nova(Delay2* unit, int inNumSamples);
+FLATTEN void Normalizer_next_nova(Normalizer* unit, int inNumSamples);
+FLATTEN void Limiter_next_nova(Limiter* unit, int inNumSamples);
+#endif
 
 void LPZ2_next(LPZ2* unit, int inNumSamples);
 void LPZ2_Ctor(LPZ2* unit);
@@ -1466,7 +1483,14 @@ void APF_next(APF* unit, int inNumSamples) {
 
 void LPZ1_Ctor(LPZ1* unit) {
     // printf("LPZ1_Reset\n");
-    SETCALC(LPZ1_next);
+#ifdef NOVA_SIMD
+    // the lookahead load spans in[vecSize-1 .. 2*vecSize-2], so a block has to hold at
+    // least two vectors for it to stay in bounds
+    if (boost::alignment::is_aligned(BUFLENGTH, 16) && BUFLENGTH >= 2 * (int)nova::vec<float>::size)
+        SETCALC(LPZ1_next_nova);
+    else
+#endif
+        SETCALC(LPZ1_next);
     unit->m_x1 = ZIN0(0);
     LPZ1_next(unit, 1);
 }
@@ -1490,12 +1514,58 @@ void LPZ1_next(LPZ1* unit, int inNumSamples) {
     unit->m_x1 = x1;
 }
 
+#ifdef NOVA_SIMD
+// out[i] = 0.5 * (in[i] + in[i-1]). Bit-identical to the scalar loop above: halving is
+// exact, so computing in float rounds exactly once, just as the double version does.
+//
+// LPZ1 is a DefineSimpleUnit, so the server may hand us out == in. The shifted vector
+// for a chunk starts at in[i-1], which lies inside the *previous* chunk's store range,
+// so it has to be loaded before that store runs -- hence the one-chunk lookahead. The
+// first chunk is done scalar because in[-1] is not ours to read; m_x1 carries it.
+FLATTEN void LPZ1_next_nova(LPZ1* unit, int inNumSamples) {
+    const int vecSize = nova::vec<float>::size;
+
+    float* out = OUT(0);
+    const float* in = IN(0);
+
+    const float lastIn = in[inNumSamples - 1]; // capture before any store can clobber it
+
+    nova::vec<float> prv;
+    prv.load(in + vecSize - 1); // before the scalar head writes out[vecSize-1]
+
+    float prev = unit->m_x1;
+    for (int i = 0; i != vecSize; ++i) {
+        float x0 = in[i];
+        out[i] = 0.5f * (x0 + prev);
+        prev = x0;
+    }
+
+    for (int i = vecSize; i != inNumSamples; i += vecSize) {
+        nova::vec<float> cur, nextPrv;
+        cur.load_aligned(in + i);
+        const int next = i + vecSize;
+        if (next != inNumSamples)
+            nextPrv.load(in + next - 1); // before this iteration's store clobbers it
+        ((cur + prv) * 0.5f).store_aligned(out + i);
+        prv = nextPrv;
+    }
+
+    unit->m_x1 = lastIn;
+}
+#endif
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
 void HPZ1_Ctor(HPZ1* unit) {
     // printf("HPZ1_Reset\n");
-    SETCALC(HPZ1_next);
+#ifdef NOVA_SIMD
+    // see LPZ1_Ctor: the lookahead load needs at least two vectors per block
+    if (boost::alignment::is_aligned(BUFLENGTH, 16) && BUFLENGTH >= 2 * (int)nova::vec<float>::size)
+        SETCALC(HPZ1_next_nova);
+    else
+#endif
+        SETCALC(HPZ1_next);
     unit->m_x1 = ZIN0(0);
     HPZ1_next(unit, 1);
 }
@@ -1521,6 +1591,41 @@ void HPZ1_next(HPZ1* unit, int inNumSamples) {
 
     unit->m_x1 = x1;
 }
+
+#ifdef NOVA_SIMD
+// out[i] = 0.5 * (in[i] - in[i-1]); see LPZ1_next_nova for why float is bit-exact and
+// why the shifted vector needs a one-chunk lookahead when out aliases in.
+FLATTEN void HPZ1_next_nova(HPZ1* unit, int inNumSamples) {
+    const int vecSize = nova::vec<float>::size;
+
+    float* out = OUT(0);
+    const float* in = IN(0);
+
+    const float lastIn = in[inNumSamples - 1];
+
+    nova::vec<float> prv;
+    prv.load(in + vecSize - 1);
+
+    float prev = unit->m_x1;
+    for (int i = 0; i != vecSize; ++i) {
+        float x0 = in[i];
+        out[i] = 0.5f * (x0 - prev);
+        prev = x0;
+    }
+
+    for (int i = vecSize; i != inNumSamples; i += vecSize) {
+        nova::vec<float> cur, nextPrv;
+        cur.load_aligned(in + i);
+        const int next = i + vecSize;
+        if (next != inNumSamples)
+            nextPrv.load(in + next - 1);
+        ((cur - prv) * 0.5f).store_aligned(out + i);
+        prv = nextPrv;
+    }
+
+    unit->m_x1 = lastIn;
+}
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1550,7 +1655,12 @@ void Slope_next(Slope* unit, int inNumSamples) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void Delay1_Ctor(Delay1* unit) {
-    SETCALC(Delay1_next);
+#ifdef NOVA_SIMD
+    if (boost::alignment::is_aligned(BUFLENGTH, 16))
+        SETCALC(Delay1_next_nova);
+    else
+#endif
+        SETCALC(Delay1_next);
     float x1 = IN0(1);
     unit->m_x1 = x1;
     ZOUT0(0) = x1;
@@ -1570,6 +1680,22 @@ void Delay1_next(Delay1* unit, int inNumSamples) {
 
     unit->m_x1 = x1;
 }
+
+#ifdef NOVA_SIMD
+// out[i] = in[i-1] -- a pure shifted copy, so exact by construction. Delay1 is a
+// DefineSimpleUnit and may get out == in; memmove is defined for overlap and is already
+// vectorized, which beats a hand-rolled loop that would have to dodge its own stores.
+FLATTEN void Delay1_next_nova(Delay1* unit, int inNumSamples) {
+    float* out = OUT(0);
+    const float* in = IN(0);
+
+    const float lastIn = in[inNumSamples - 1]; // before memmove overwrites it
+    memmove(out + 1, in, (inNumSamples - 1) * sizeof(float));
+    out[0] = unit->m_x1; // after the move, which reads in[0]
+
+    unit->m_x1 = lastIn;
+}
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1607,7 +1733,12 @@ void Flip_next_odd(Flip* unit, int inNumSamples) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void Delay2_Ctor(Delay2* unit) {
-    SETCALC(Delay2_next);
+#ifdef NOVA_SIMD
+    if (boost::alignment::is_aligned(BUFLENGTH, 16))
+        SETCALC(Delay2_next_nova);
+    else
+#endif
+        SETCALC(Delay2_next);
     float x1 = IN0(1);
     float x2 = IN0(2);
     unit->m_x1 = x1;
@@ -1631,6 +1762,26 @@ void Delay2_next(Delay2* unit, int inNumSamples) {
     unit->m_x1 = x1;
     unit->m_x2 = x2;
 }
+
+#ifdef NOVA_SIMD
+// out[i] = in[i-2] -- a pure shifted copy. The scalar version routes samples through
+// double locals but never does arithmetic on them, so staying in float is exact.
+// See Delay1_next_nova for why this is a memmove. Only reached when BUFLENGTH is a
+// multiple of 16, so inNumSamples >= 2 holds.
+FLATTEN void Delay2_next_nova(Delay2* unit, int inNumSamples) {
+    float* out = OUT(0);
+    const float* in = IN(0);
+
+    const float lastIn1 = in[inNumSamples - 1]; // before memmove overwrites them
+    const float lastIn2 = in[inNumSamples - 2];
+    memmove(out + 2, in, (inNumSamples - 2) * sizeof(float));
+    out[0] = unit->m_x2; // after the move, which reads in[0] and in[1]
+    out[1] = unit->m_x1;
+
+    unit->m_x1 = lastIn1;
+    unit->m_x2 = lastIn2;
+}
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -3305,7 +3456,12 @@ void Compander_next(Compander* unit, int inNumSamples) {
 void Normalizer_Dtor(Normalizer* unit) { RTFree(unit->mWorld, unit->m_table); }
 
 void Normalizer_Ctor(Normalizer* unit) {
+#ifdef NOVA_SIMD
+    // no block-length constraint: the inner loop handles any nsmps via its scalar remainder
+    SETCALC(Normalizer_next_nova);
+#else
     SETCALC(Normalizer_next);
+#endif
     // printf("Normalizer_Reset\n");
 
     float dur = ZIN0(2);
@@ -3389,13 +3545,126 @@ void Normalizer_next(Normalizer* unit, int inNumSamples) {
     unit->m_curmaxval = curmaxval;
 }
 
+#ifdef NOVA_SIMD
+// Shared inner loop for Normalizer and Limiter, which are identical here: stash the input
+// in the analysis buffer, apply the ramped gain to the delayed buffer, and track the
+// running |max|. Max is associative and exact, so the vector reduction is bit-identical
+// to the scalar running max; only the gain ramp reassociates. Loads/stores are unaligned
+// because pos is arbitrary and the buffers carry a ZOFF bias.
+template <bool ApplyGain>
+static inline void Normalizer_inner_nova(float* out, const float* in, float* xinbuf, const float* xoutbuf, long nsmps,
+                                         float& level, float slope, float& curmaxval) {
+    const int vecSize = nova::vec<float>::size;
+    const long nvec = nsmps & ~(long)(vecSize - 1);
+
+    if (nvec) {
+        nova::vec<float> vlevel;
+        const nova::vec<float> vinc(vlevel.set_slope(level, slope));
+        nova::vec<float> vmax(curmaxval);
+        const nova::vec<float> zero(0.f);
+
+        for (long i = 0; i != nvec; i += vecSize) {
+            nova::vec<float> vin;
+            vin.load(in + i);
+            vin.store(xinbuf + i);
+
+            if (ApplyGain) {
+                nova::vec<float> vxout;
+                vxout.load(xoutbuf + i);
+                (vlevel * vxout).store(out + i);
+            } else
+                zero.store(out + i);
+
+            vmax = max_(vmax, abs(vin));
+            vlevel += vinc;
+        }
+        curmaxval = vmax.horizontal_max();
+        level += nvec * slope;
+    }
+
+    for (long i = nvec; i != nsmps; ++i) {
+        float val = in[i];
+        xinbuf[i] = val;
+        out[i] = ApplyGain ? level * xoutbuf[i] : 0.f;
+        level += slope;
+        val = std::abs(val);
+        if (val > curmaxval)
+            curmaxval = val;
+    }
+}
+
+FLATTEN void Normalizer_next_nova(Normalizer* unit, int inNumSamples) {
+    const float* in = IN(0);
+    float* out = OUT(0);
+    float amp = ZIN0(1);
+
+    long pos = unit->m_pos;
+    float slope = unit->m_slope;
+    float level = unit->m_level;
+    float curmaxval = unit->m_curmaxval;
+
+    long bufsize = unit->m_bufsize;
+    long buf_remain = bufsize - pos;
+
+    long remain = inNumSamples;
+    while (remain > 0) {
+        long nsmps = sc_min(remain, buf_remain);
+        float* xinbuf = unit->m_xinbuf + pos + ZOFF;
+        const float* xoutbuf = unit->m_xoutbuf + pos + ZOFF;
+
+        if (unit->m_flips >= 2)
+            Normalizer_inner_nova<true>(out, in, xinbuf, xoutbuf, nsmps, level, slope, curmaxval);
+        else
+            Normalizer_inner_nova<false>(out, in, xinbuf, xoutbuf, nsmps, level, slope, curmaxval);
+
+        in += nsmps;
+        out += nsmps;
+
+        pos += nsmps;
+        if (pos >= bufsize) {
+            pos = 0;
+            buf_remain = bufsize;
+
+            float maxval2 = sc_max(unit->m_prevmaxval, curmaxval);
+            unit->m_prevmaxval = curmaxval;
+            unit->m_curmaxval = curmaxval = 0.f;
+
+            float next_level;
+            if (maxval2 <= 0.00001f)
+                next_level = 100000.f * amp;
+            else
+                next_level = amp / maxval2;
+
+            slope = unit->m_slope = (next_level - level) * unit->m_slopefactor;
+
+            float* temp = unit->m_xoutbuf;
+            unit->m_xoutbuf = unit->m_xmidbuf;
+            unit->m_xmidbuf = unit->m_xinbuf;
+            unit->m_xinbuf = temp;
+
+            unit->m_flips++;
+        }
+        remain -= nsmps;
+    }
+
+    unit->m_pos = pos;
+    unit->m_level = level;
+    unit->m_curmaxval = curmaxval;
+}
+#endif
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void Limiter_Dtor(Limiter* unit) { RTFree(unit->mWorld, unit->m_table); }
 
 void Limiter_Ctor(Limiter* unit) {
     // printf("Limiter_Reset\n");
+#ifdef NOVA_SIMD
+    // see Normalizer_Ctor
+    SETCALC(Limiter_next_nova);
+#else
     SETCALC(Limiter_next);
+#endif
 
     float dur = ZIN0(2);
     unit->m_bufsize = (long)(ceil(dur * SAMPLERATE));
@@ -3477,6 +3746,68 @@ void Limiter_next(Limiter* unit, int inNumSamples) {
     unit->m_level = level;
     unit->m_curmaxval = curmaxval;
 }
+
+#ifdef NOVA_SIMD
+// Same structure as Limiter_next; only the next_level rule differs from Normalizer.
+FLATTEN void Limiter_next_nova(Limiter* unit, int inNumSamples) {
+    const float* in = IN(0);
+    float* out = OUT(0);
+    float amp = ZIN0(1);
+
+    long pos = unit->m_pos;
+    float slope = unit->m_slope;
+    float level = unit->m_level;
+    float curmaxval = unit->m_curmaxval;
+
+    long bufsize = unit->m_bufsize;
+    long buf_remain = bufsize - pos;
+
+    long remain = inNumSamples;
+    while (remain > 0) {
+        long nsmps = sc_min(remain, buf_remain);
+        float* xinbuf = unit->m_xinbuf + pos + ZOFF;
+        const float* xoutbuf = unit->m_xoutbuf + pos + ZOFF;
+
+        if (unit->m_flips >= 2)
+            Normalizer_inner_nova<true>(out, in, xinbuf, xoutbuf, nsmps, level, slope, curmaxval);
+        else
+            Normalizer_inner_nova<false>(out, in, xinbuf, xoutbuf, nsmps, level, slope, curmaxval);
+
+        in += nsmps;
+        out += nsmps;
+
+        pos += nsmps;
+        if (pos >= bufsize) {
+            pos = 0;
+            buf_remain = bufsize;
+
+            float maxval2 = sc_max(unit->m_prevmaxval, curmaxval);
+            unit->m_prevmaxval = curmaxval;
+            unit->m_curmaxval = curmaxval = 0.f;
+
+            float next_level;
+            if (maxval2 > amp)
+                next_level = amp / maxval2;
+            else
+                next_level = 1.0;
+
+            slope = unit->m_slope = (next_level - level) * unit->m_slopefactor;
+
+            float* temp = unit->m_xoutbuf;
+            unit->m_xoutbuf = unit->m_xmidbuf;
+            unit->m_xmidbuf = unit->m_xinbuf;
+            unit->m_xinbuf = temp;
+
+            unit->m_flips++;
+        }
+        remain -= nsmps;
+    }
+
+    unit->m_pos = pos;
+    unit->m_level = level;
+    unit->m_curmaxval = curmaxval;
+}
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 

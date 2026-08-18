@@ -25,6 +25,11 @@
 #include "SC_PlugIn.h"
 #include <cstdio>
 
+#ifdef NOVA_SIMD
+#    include <emmintrin.h>
+#    include <xmmintrin.h>
+#endif
+
 #include <boost/align/is_aligned.hpp>
 
 using namespace std; // for math functions
@@ -953,6 +958,74 @@ void PlayBuf_Ctor(PlayBuf* unit) {
 }
 
 
+#ifdef NOVA_SIMD
+// Mono cubic fast path shared by BufRd_next_4 and PlayBuf. For a single-channel buffer
+// the four cubic taps are four *adjacent* floats, so one unaligned 128-bit load per
+// sample plus a 4x4 transpose replaces the per-tap scalar loads. This is deliberately
+// not a gather: an AVX2 _mm256_i32gather_ps version measured ~2x SLOWER than scalar even
+// on a core with fast gather, because it needs four gathers per group.
+// Utilizing nova-simd transpose functions. The arithmetic is cubicinterp's
+// in its original order, so results are bit-identical to the scalar path.
+static inline void BufRd_cubic_mono_simd(float* out, const float* bufData, const int32* iphase, const float* frac) {
+    nova::vec<float> r0, r1, r2, r3;
+    r0.load(bufData + iphase[0] - 1);
+    r1.load(bufData + iphase[1] - 1);
+    r2.load(bufData + iphase[2] - 1);
+    r3.load(bufData + iphase[3] - 1);
+    nova::transpose(r0, r1, r2, r3); // r0 = y0[4], r1 = y1[4], r2 = y2[4], r3 = y3[4]
+
+    nova::vec<float> x;
+    x.load(frac);
+
+    nova::vec<float> c0 = r1;
+    nova::vec<float> c1 = 0.5f * (r2 - r0);
+    nova::vec<float> c2 = r0 - 2.5f * r1 + 2.f * r2 - 0.5f * r3;
+    nova::vec<float> c3 = 0.5f * (r3 - r0) + 1.5f * (r1 - r2);
+
+    nova::vec<float> res = ((c3 * x + c2) * x + c1) * x + c0;
+    res.store(out);
+}
+
+// Linear (interpolation = 2) counterpart, BufRd's default. The two taps are adjacent, so
+// the same transpose yields both from the same four loads; the upper two rows are unused.
+static inline void BufRd_linear_mono_simd(float* out, const float* bufData, const int32* iphase, const float* frac) {
+    nova::vec<float> r0, r1, r2, r3;
+    r0.load(bufData + iphase[0]);
+    r1.load(bufData + iphase[1]);
+    r2.load(bufData + iphase[2]);
+    r3.load(bufData + iphase[3]);
+    nova::transpose(r0, r1, r2, r3); // r0 = b[4], r1 = c[4]; r2/r3 unused
+
+    nova::vec<float> x;
+    x.load(frac);
+    nova::vec<float> res = r0 + x * (r1 - r0);
+    res.store(out);
+}
+
+// Splits four phases into integer and fractional parts. sc_loop is the identity exactly
+// when a phase is already in [0, loopMax), which is the overwhelmingly common case, so we
+// test that for the whole group up front and bail out otherwise -- that way the fast path
+// never calls sc_loop and so can never trip its mDone side effect speculatively.
+// Returns false if any phase needs real wrapping, leaving iphase/frac untouched.
+static inline bool BufRd_phase4_simd(double q0, double q1, double q2, double q3, double loopMax, int32* iphase,
+                                     float* frac) {
+    if (q0 < 0.0 || q0 >= loopMax || q1 < 0.0 || q1 >= loopMax || q2 < 0.0 || q2 >= loopMax || q3 < 0.0
+        || q3 >= loopMax) {
+        return false;
+    }
+    iphase[0] = (int32)q0;
+    iphase[1] = (int32)q1;
+    iphase[2] = (int32)q2;
+    iphase[3] = (int32)q3;
+    frac[0] = (float)(q0 - iphase[0]);
+    frac[1] = (float)(q1 - iphase[1]);
+    frac[2] = (float)(q2 - iphase[2]);
+    frac[3] = (float)(q3 - iphase[3]);
+    return true;
+}
+
+#endif
+
 void PlayBuf_next_aa(PlayBuf* unit, int inNumSamples) {
     float* ratein = ZIN(1);
     float* trigin = ZIN(2);
@@ -984,7 +1057,53 @@ void PlayBuf_next_aa(PlayBuf* unit, int inNumSamples) {
     double phase = unit->m_phase;
     float prevtrig = unit->m_prevtrig;
 
-    for (int i = 0; i < inNumSamples; ++i) {
+    int i = 0;
+
+#ifdef NOVA_SIMD
+    // Audio rate for both rate and trigger: combines the per-sample phase recurrence of
+    // PlayBuf_next_ak with the no-trigger-edge requirement of PlayBuf_next_ka.
+    if (bufChannels == 1 && numOutputs == 1) {
+        const float* rateinRaw = IN(1);
+        const float* triginRaw = IN(2);
+        float* out0 = OUT(0);
+        for (; i + 4 <= inNumSamples; i += 4) {
+            float pv = prevtrig;
+            bool edge = false;
+            for (int k = 0; k < 4; ++k) {
+                float t = triginRaw[i + k];
+                if (t > 0.f && pv <= 0.f)
+                    edge = true;
+                pv = t;
+            }
+            if (edge)
+                break;
+
+            int32 iphase[4];
+            float frac[4];
+
+            double q0 = phase;
+            double q1 = q0 + rateinRaw[i];
+            double q2 = q1 + rateinRaw[i + 1];
+            double q3 = q2 + rateinRaw[i + 2];
+
+            if (!BufRd_phase4_simd(q0, q1, q2, q3, loopMax, iphase, frac))
+                break;
+
+            int32 lo = sc_min(sc_min(iphase[0], iphase[1]), sc_min(iphase[2], iphase[3]));
+            int32 hi = sc_max(sc_max(iphase[0], iphase[1]), sc_max(iphase[2], iphase[3]));
+            if (lo < 1 || hi >= guardFrame)
+                break;
+
+            BufRd_cubic_mono_simd(out0 + i, bufData, iphase, frac);
+            phase = q3 + rateinRaw[i + 3];
+            prevtrig = pv;
+        }
+        ratein += i; // ZXP resumes at IN(1)[i] / IN(2)[i]
+        trigin += i;
+    }
+#endif
+
+    for (; i < inNumSamples; ++i) {
         float trig = ZXP(trigin);
         if (trig > 0.f && prevtrig <= 0.f) {
             unit->mDone = false;
@@ -1040,7 +1159,41 @@ void PlayBuf_next_ak(PlayBuf* unit, int inNumSamples) {
         phase = ZIN0(3);
     }
     unit->m_prevtrig = trig;
-    for (int i = 0; i < inNumSamples; ++i) {
+
+    int i = 0;
+
+#ifdef NOVA_SIMD
+    // Same mono cubic fast path as PlayBuf_next_kk, but the rate is audio rate, so each
+    // step of the phase recurrence uses its own rate sample. Still chained by repeated
+    // addition to stay bit-identical to the scalar loop.
+    if (bufChannels == 1 && numOutputs == 1) {
+        const float* rateinRaw = IN(1);
+        float* out0 = OUT(0);
+        for (; i + 4 <= inNumSamples; i += 4) {
+            int32 iphase[4];
+            float frac[4];
+
+            double q0 = phase;
+            double q1 = q0 + rateinRaw[i];
+            double q2 = q1 + rateinRaw[i + 1];
+            double q3 = q2 + rateinRaw[i + 2];
+
+            if (!BufRd_phase4_simd(q0, q1, q2, q3, loopMax, iphase, frac))
+                break;
+
+            int32 lo = sc_min(sc_min(iphase[0], iphase[1]), sc_min(iphase[2], iphase[3]));
+            int32 hi = sc_max(sc_max(iphase[0], iphase[1]), sc_max(iphase[2], iphase[3]));
+            if (lo < 1 || hi >= guardFrame)
+                break;
+
+            BufRd_cubic_mono_simd(out0 + i, bufData, iphase, frac);
+            phase = q3 + rateinRaw[i + 3];
+        }
+        ratein += i; // ZXP resumes at IN(1)[i]
+    }
+#endif
+
+    for (; i < inNumSamples; ++i) {
         LOOP_BODY_4(i)
 
         phase += ZXP(ratein);
@@ -1068,7 +1221,41 @@ void PlayBuf_next_kk(PlayBuf* unit, int inNumSamples) {
         phase = ZIN0(3);
     }
     unit->m_prevtrig = trig;
-    for (int i = 0; i < inNumSamples; ++i) {
+
+    int i = 0;
+
+#ifdef NOVA_SIMD
+    // Same mono cubic fast path as BufRd_next_4; see BufRd_cubic_mono_simd. phase is only
+    // committed once a group is known to be interior, so on the first non-interior group
+    // we drop out with phase untouched and the scalar loop redoes that group.
+    if (bufChannels == 1 && numOutputs == 1) {
+        float* out0 = OUT(0);
+        for (; i + 4 <= inNumSamples; i += 4) {
+            int32 iphase[4];
+            float frac[4];
+
+            // the scalar loop advances by repeated addition, so the four phases must be
+            // chained the same way -- phase + k * rate would not be bit-identical
+            double q0 = phase;
+            double q1 = q0 + rate;
+            double q2 = q1 + rate;
+            double q3 = q2 + rate;
+
+            if (!BufRd_phase4_simd(q0, q1, q2, q3, loopMax, iphase, frac))
+                break;
+
+            int32 lo = sc_min(sc_min(iphase[0], iphase[1]), sc_min(iphase[2], iphase[3]));
+            int32 hi = sc_max(sc_max(iphase[0], iphase[1]), sc_max(iphase[2], iphase[3]));
+            if (lo < 1 || hi >= guardFrame)
+                break;
+
+            BufRd_cubic_mono_simd(out0 + i, bufData, iphase, frac);
+            phase = q3 + rate;
+        }
+    }
+#endif
+
+    for (; i < inNumSamples; ++i) {
         LOOP_BODY_4(i)
 
         phase += rate;
@@ -1091,7 +1278,53 @@ void PlayBuf_next_ka(PlayBuf* unit, int inNumSamples) {
     double loopMax = (double)(loop ? bufFrames : bufFrames - 1);
     double phase = unit->m_phase;
     float prevtrig = unit->m_prevtrig;
-    for (int i = 0; i < inNumSamples; ++i) {
+
+    int i = 0;
+
+#ifdef NOVA_SIMD
+    // The trigger is audio rate and a rising edge resets phase mid-block, so a group only
+    // qualifies if it contains no edge; otherwise it falls through to the scalar loop.
+    // Triggers are sparse in practice, so this almost always holds.
+    if (bufChannels == 1 && numOutputs == 1) {
+        const float* triginRaw = IN(2);
+        float* out0 = OUT(0);
+        for (; i + 4 <= inNumSamples; i += 4) {
+            float pv = prevtrig;
+            bool edge = false;
+            for (int k = 0; k < 4; ++k) {
+                float t = triginRaw[i + k];
+                if (t > 0.f && pv <= 0.f)
+                    edge = true;
+                pv = t;
+            }
+            if (edge)
+                break;
+
+            int32 iphase[4];
+            float frac[4];
+
+            double q0 = phase;
+            double q1 = q0 + rate;
+            double q2 = q1 + rate;
+            double q3 = q2 + rate;
+
+            if (!BufRd_phase4_simd(q0, q1, q2, q3, loopMax, iphase, frac))
+                break;
+
+            int32 lo = sc_min(sc_min(iphase[0], iphase[1]), sc_min(iphase[2], iphase[3]));
+            int32 hi = sc_max(sc_max(iphase[0], iphase[1]), sc_max(iphase[2], iphase[3]));
+            if (lo < 1 || hi >= guardFrame)
+                break;
+
+            BufRd_cubic_mono_simd(out0 + i, bufData, iphase, frac);
+            phase = q3 + rate;
+            prevtrig = pv; // only committed once the group is taken
+        }
+        trigin += i; // ZXP resumes at IN(2)[i]
+    }
+#endif
+
+    for (; i < inNumSamples; ++i) {
         float trig = ZXP(trigin);
         if (trig > 0.f && prevtrig <= 0.f) {
             unit->mDone = false;
@@ -1136,7 +1369,7 @@ void BufRd_Ctor(BufRd* unit) {
 }
 
 void BufRd_next_4(BufRd* unit, int inNumSamples) {
-    float* phasein = ZIN(1);
+    const float* phasein = IN(1);
     int32 loop = (int32)ZIN0(2);
 
     GET_BUF_SHARED
@@ -1146,14 +1379,40 @@ void BufRd_next_4(BufRd* unit, int inNumSamples) {
 
     double loopMax = (double)(loop ? bufFrames : bufFrames - 1);
 
-    for (int i = 0; i < inNumSamples; ++i) {
-        double phase = ZXP(phasein);
+    int i = 0;
+
+#ifdef NOVA_SIMD
+    // Only frames strictly inside the buffer qualify: at iphase == 0 or >= guardFrame,
+    // LOOP_BODY_4 rewrites the tap pointers and they are no longer contiguous. Leaving
+    // the loop on the first such group is fine -- sc_loop is idempotent on an
+    // already-wrapped phase and mDone is sticky, so the scalar loop below redoes them.
+    if (bufChannels == 1 && numOutputs == 1) {
+        float* out0 = OUT(0);
+        for (; i + 4 <= inNumSamples; i += 4) {
+            int32 iphase[4];
+            float frac[4];
+
+            if (!BufRd_phase4_simd(phasein[i], phasein[i + 1], phasein[i + 2], phasein[i + 3], loopMax, iphase, frac))
+                break;
+
+            int32 lo = sc_min(sc_min(iphase[0], iphase[1]), sc_min(iphase[2], iphase[3]));
+            int32 hi = sc_max(sc_max(iphase[0], iphase[1]), sc_max(iphase[2], iphase[3]));
+            if (lo < 1 || hi >= guardFrame)
+                break;
+
+            BufRd_cubic_mono_simd(out0 + i, bufData, iphase, frac);
+        }
+    }
+#endif
+
+    for (; i < inNumSamples; ++i) {
+        double phase = phasein[i];
         LOOP_BODY_4(i)
     }
 }
 
 void BufRd_next_2(BufRd* unit, int inNumSamples) {
-    float* phasein = ZIN(1);
+    const float* phasein = IN(1);
     int32 loop = (int32)ZIN0(2);
 
     GET_BUF_SHARED
@@ -1163,8 +1422,33 @@ void BufRd_next_2(BufRd* unit, int inNumSamples) {
 
     double loopMax = (double)(loop ? bufFrames : bufFrames - 1);
 
-    for (int i = 0; i < inNumSamples; ++i) {
-        double phase = ZXP(phasein);
+    int i = 0;
+
+#ifdef NOVA_SIMD
+    // upper bound is iphase + 3 < bufFrames (the width of the 128-bit load), which also
+    // keeps us below LOOP_BODY_2's iphase > guardFrame fixup
+    const int32 maxIphase = (int32)bufFrames - 4;
+    if (bufChannels == 1 && numOutputs == 1 && maxIphase >= 0) {
+        float* out0 = OUT(0);
+        for (; i + 4 <= inNumSamples; i += 4) {
+            int32 iphase[4];
+            float frac[4];
+
+            if (!BufRd_phase4_simd(phasein[i], phasein[i + 1], phasein[i + 2], phasein[i + 3], loopMax, iphase, frac))
+                break;
+
+            int32 lo = sc_min(sc_min(iphase[0], iphase[1]), sc_min(iphase[2], iphase[3]));
+            int32 hi = sc_max(sc_max(iphase[0], iphase[1]), sc_max(iphase[2], iphase[3]));
+            if (lo < 0 || hi > maxIphase)
+                break;
+
+            BufRd_linear_mono_simd(out0 + i, bufData, iphase, frac);
+        }
+    }
+#endif
+
+    for (; i < inNumSamples; ++i) {
+        double phase = phasein[i];
         LOOP_BODY_2(i)
     }
 }
