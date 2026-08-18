@@ -25,10 +25,6 @@
 #include "SC_PlugIn.h"
 #include <cstdio>
 
-#ifdef NOVA_SIMD
-#    include <emmintrin.h>
-#    include <xmmintrin.h>
-#endif
 
 #include <boost/align/is_aligned.hpp>
 
@@ -972,7 +968,7 @@ static inline void BufRd_cubic_mono_simd(float* out, const float* bufData, const
     r1.load(bufData + iphase[1] - 1);
     r2.load(bufData + iphase[2] - 1);
     r3.load(bufData + iphase[3] - 1);
-    nova::transpose(r0, r1, r2, r3); // r0 = y0[4], r1 = y1[4], r2 = y2[4], r3 = y3[4]
+    transpose(r0, r1, r2, r3); // r0 = y0[4], r1 = y1[4], r2 = y2[4], r3 = y3[4]
 
     nova::vec<float> x;
     x.load(frac);
@@ -994,7 +990,7 @@ static inline void BufRd_linear_mono_simd(float* out, const float* bufData, cons
     r1.load(bufData + iphase[1]);
     r2.load(bufData + iphase[2]);
     r3.load(bufData + iphase[3]);
-    nova::transpose(r0, r1, r2, r3); // r0 = b[4], r1 = c[4]; r2/r3 unused
+    transpose(r0, r1, r2, r3); // r0 = b[4], r1 = c[4]; r2/r3 unused
 
     nova::vec<float> x;
     x.load(frac);
